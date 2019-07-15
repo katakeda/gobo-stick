@@ -1,58 +1,30 @@
 package main
 
 import (
-	"database/sql"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/go-redis/redis"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/securecookie"
 	"github.com/joho/godotenv"
 	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
 )
 
+// User ...
 type User struct {
 	id       int
 	username string
 	password string
 	email    string
 }
-
-type OauthClient struct {
-	config *oauth2.Config
-}
-
-func (auth *OauthClient) init() {
-	auth.config = &oauth2.Config{
-		ClientID:     os.Getenv("CLIENT_ID"),
-		ClientSecret: os.Getenv("CLIENT_SECRET"),
-		RedirectURL:  os.Getenv("REDIRECT_URL"),
-		Scopes: []string{
-			"https://www.googleapis.com/auth/userinfo.email",
-			"https://www.googleapis.com/auth/userinfo.profile",
-		},
-		Endpoint: google.Endpoint,
-	}
-}
-
-var auth OauthClient
-
-var redisClient = redis.NewClient(&redis.Options{
-	Addr:     "localhost:6000",
-	Password: "",
-	DB:       0,
-})
 
 func main() {
 	// Load env variables
@@ -61,13 +33,26 @@ func main() {
 	// Initialize OAuth config
 	auth.init()
 
+	// Initialize Redis config
+	redisClient.init()
+
+	// Initialize OpenID config
+	if err := openid.init(); err != nil {
+		log.Fatal(err)
+	}
+
+	// Initialize Database config
+	if err := db.init(); err != nil {
+		log.Fatal(err)
+	}
+
 	// Init Router
 	router := mux.NewRouter()
 
 	// Routes
 	router.HandleFunc("/api/sign-in-with-google", handleSignInRequest).Methods("GET")
 	router.HandleFunc("/api/auth/google/callback", handleCallback).Methods("GET")
-	router.HandleFunc("/api/profile", getProfile).Methods("POST")
+	router.HandleFunc("/api/profile", getProfile).Methods("GET")
 
 	log.Fatal(http.ListenAndServe(":8888", router))
 }
@@ -78,12 +63,9 @@ func handleSignInRequest(w http.ResponseWriter, r *http.Request) {
 	state := base64.URLEncoding.EncodeToString(securekey)
 	url := auth.config.AuthCodeURL(state)
 
-	// Set state token as cookie
-	expires := time.Now().Add(365 * 24 * time.Hour)
-	cookie := http.Cookie{Name: "oauth_state", Value: state, Expires: expires}
-	redisClient.Set(state, state, expires.Sub(expires))
+	// Store state token for validation
+	redisClient.client.Set(state, state, time.Minute)
 
-	http.SetCookie(w, &cookie)
 	http.Redirect(w, r, url, 302)
 }
 
@@ -93,56 +75,85 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 	state := r.FormValue("state")
 
 	// Validate state token
-	if _, err := redisClient.Get(state).Result(); err != nil {
-		log.Println("Unmatched state")
+	if err := redisClient.client.Get(state).Err(); err != nil {
+		http.Redirect(w, r, os.Getenv("APP_URL"), 302)
 		return
 	}
 
 	// Exchange authorization code for token
 	token, err := auth.config.Exchange(oauth2.NoContext, code)
 	if err != nil {
-		log.Fatal(err)
+		http.Redirect(w, r, os.Getenv("APP_URL"), 302)
 		return
 	}
-
-	// Fetch Google's openid configuration JSON
-	openid, err := http.Get("https://accounts.google.com/.well-known/openid-configuration")
-	if err != nil {
-		log.Fatal(err)
-		return
-	}
-	defer openid.Body.Close()
-	data1, _ := ioutil.ReadAll(openid.Body)
-	var config map[string]interface{}
-	json.Unmarshal(data1, &config)
 
 	// Fetch userinfo
-	endpoint := fmt.Sprintf("%v", config["userinfo_endpoint"])
 	client := auth.config.Client(oauth2.NoContext, token)
-	response, err := client.Get(endpoint)
+	response, err := client.Get(openid.get("userinfo_endpoint"))
 	if err != nil {
-		log.Fatal(err)
+		http.Redirect(w, r, os.Getenv("APP_URL"), 302)
 		return
 	}
 	defer response.Body.Close()
-	data2, _ := ioutil.ReadAll(response.Body)
+	data, _ := ioutil.ReadAll(response.Body)
 	var userinfo map[string]interface{}
-	json.Unmarshal(data2, &userinfo)
+	json.Unmarshal(data, &userinfo)
 
 	// Authenticate user
 	var user User
-	db, err := sql.Open("postgres", "hasura:hasura@tcp(localhost:5432)/hasura")
-	if err != nil {
-		log.Fatal(err)
+	if err := db.client.PingContext(oauth2.NoContext); err != nil {
+		http.Redirect(w, r, os.Getenv("APP_URL"), 302)
 		return
 	}
-	row := db.QueryRow(`SELECT * FROM user WHERE email=$1;`, userinfo["email"])
-	row.Scan(&user.id, &user.username, &user.password, &user.email)
-	log.Printf("%+v", user)
-	defer db.Close()
+
+	defer db.client.Close()
+	row := db.client.QueryRow("SELECT id, email FROM user WHERE email=?", userinfo["email"])
+	row.Scan(&user.id, &user.email)
+	if user.email == "" {
+		http.Redirect(w, r, os.Getenv("APP_URL"), 302)
+		return
+	}
+
+	// Set access token key in cookie and key-value pair in Redis
+	securekey := base64.URLEncoding.EncodeToString(securecookie.GenerateRandomKey(32))
+	expires := time.Now().Add(time.Hour)
+	cookie := http.Cookie{
+		Name:     os.Getenv("SESSION_NAME"),
+		Value:    securekey,
+		Path:     "/",
+		Expires:  expires,
+		HttpOnly: true,
+	}
+	redisClient.client.Set(securekey, token.AccessToken, time.Hour)
+	http.SetCookie(w, &cookie)
+	http.Redirect(w, r, os.Getenv("APP_URL"), 302)
 }
 
 func getProfile(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie(os.Getenv("SESSION_NAME"))
+	if err != nil {
+		http.Redirect(w, r, os.Getenv("APP_URL"), 302)
+		return
+	}
+
+	// Exchange cookie value with access token
+	accessToken, err := redisClient.client.Get(cookie.Value).Result()
+	if err != nil {
+		http.Redirect(w, r, os.Getenv("APP_URL"), 302)
+		return
+	}
+
+	// Fetch userinfo
+	response, err := http.Get(openid.get("userinfo_endpoint") + "?access_token=" + accessToken)
+	if err != nil {
+		http.Redirect(w, r, os.Getenv("APP_URL"), 302)
+		return
+	}
+	defer response.Body.Close()
+	data, _ := ioutil.ReadAll(response.Body)
+	var userinfo map[string]interface{}
+	json.Unmarshal(data, &userinfo)
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode("")
+	json.NewEncoder(w).Encode(userinfo)
 }
