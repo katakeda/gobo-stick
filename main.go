@@ -54,7 +54,7 @@ func main() {
 	router.HandleFunc("/api/auth/google/callback", handleCallback).Methods("GET")
 	router.HandleFunc("/api/profile", getProfile).Methods("GET")
 
-	log.Fatal(http.ListenAndServe(":8888", router))
+	log.Fatal(http.ListenAndServe(os.Getenv("HTTP_PORT"), router))
 }
 
 func handleSignInRequest(w http.ResponseWriter, r *http.Request) {
