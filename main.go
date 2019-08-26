@@ -106,7 +106,6 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	defer db.client.Close()
 	row := db.client.QueryRow("SELECT id, email FROM user WHERE email=?", userinfo["email"])
 	row.Scan(&user.id, &user.email)
 	if user.email == "" {
